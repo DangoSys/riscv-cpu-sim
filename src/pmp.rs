@@ -38,7 +38,11 @@ impl Pmp {
     }
 
     pub fn allows(&self, address: u64, width: Width, access: Access, mode: Privilege) -> bool {
-        let end = address as u128 + width as u128;
+        self.allows_range(address, width as usize, access, mode)
+    }
+
+    pub fn allows_range(&self, address: u64, bytes: usize, access: Access, mode: Privilege) -> bool {
+        let end = address as u128 + bytes as u128;
         for index in 0..16 {
             let config = self.config[index];
             let encoded = self.address[index];
