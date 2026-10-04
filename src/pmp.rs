@@ -1,11 +1,25 @@
 use crate::{bus::Width, Access, Privilege};
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static GENERATION: AtomicU64 = AtomicU64::new(1);
+
 const ADDRESS_MASK: u64 = (1 << 54) - 1;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Pmp {
     config: [u8; 16],
     address: [u64; 16],
+    regions: [Region; 16],
+    count: usize,
+    generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct Region {
+    start: u128,
+    limit: u128,
+    config: u8,
 }
 
 impl Pmp {
@@ -26,14 +40,21 @@ impl Pmp {
         if value & 3 == 2 {
             value &= !2;
         }
-        self.config[index] = value;
+        if self.config[index] != value {
+            self.config[index] = value;
+            self.rebuild();
+        }
     }
 
     pub fn set_address(&mut self, index: usize, value: u64) {
         let locked = self.config[index] & 0x80 != 0;
         let locked_upper_tor = index < 15 && self.config[index + 1] & 0x98 == 0x88;
         if !locked && !locked_upper_tor {
-            self.address[index] = value & ADDRESS_MASK;
+            let value = value & ADDRESS_MASK;
+            if self.address[index] != value {
+                self.address[index] = value;
+                self.rebuild();
+            }
         }
     }
 
@@ -41,8 +62,13 @@ impl Pmp {
         self.allows_range(address, width as usize, access, mode)
     }
 
-    pub fn allows_range(&self, address: u64, bytes: usize, access: Access, mode: Privilege) -> bool {
-        let end = address as u128 + bytes as u128;
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn rebuild(&mut self) {
+        self.generation = GENERATION.fetch_add(1, Ordering::Relaxed);
+        self.count = 0;
         for index in 0..16 {
             let config = self.config[index];
             let encoded = self.address[index];
@@ -60,14 +86,24 @@ impl Pmp {
                 }
                 _ => unreachable!(),
             };
-            if start >= limit || address as u128 >= limit || end <= start {
+            if start < limit {
+                self.regions[self.count] = Region { start, limit, config };
+                self.count += 1;
+            }
+        }
+    }
+
+    pub fn allows_range(&self, address: u64, bytes: usize, access: Access, mode: Privilege) -> bool {
+        let end = address as u128 + bytes as u128;
+        for region in &self.regions[..self.count] {
+            if address as u128 >= region.limit || end <= region.start {
                 continue;
             }
             // The first overlapping entry must cover the entire access, even in M mode.
-            if (address as u128) < start || end > limit {
+            if (address as u128) < region.start || end > region.limit {
                 return false;
             }
-            if mode == Privilege::Machine && config & 0x80 == 0 {
+            if mode == Privilege::Machine && region.config & 0x80 == 0 {
                 return true;
             }
             let permission = match access {
@@ -75,7 +111,7 @@ impl Pmp {
                 Access::Load => 1,
                 Access::Store => 2,
             };
-            return config & permission != 0;
+            return region.config & permission != 0;
         }
         mode == Privilege::Machine
     }

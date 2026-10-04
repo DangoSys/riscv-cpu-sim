@@ -6,7 +6,6 @@ pub const SPIE: u64 = 1 << 5;
 pub const MPIE: u64 = 1 << 7;
 pub const SPP: u64 = 1 << 8;
 pub const MPP: u64 = 3 << 11;
-pub const VS: u64 = 3 << 9;
 pub const FS: u64 = 3 << 13;
 pub const MPRV: u64 = 1 << 17;
 pub const TVM: u64 = 1 << 20;
@@ -14,7 +13,7 @@ pub const TW: u64 = 1 << 21;
 pub const TSR: u64 = 1 << 22;
 pub const INTERRUPTS: u64 = 0xaaa;
 pub const S_INTERRUPTS: u64 = 0x222;
-const SSTATUS: u64 = SIE | SPIE | SPP | VS | FS | (3 << 18);
+const SSTATUS: u64 = SIE | SPIE | SPP | FS | (3 << 18);
 const MSTATUS: u64 = SSTATUS | MIE | MPIE | MPP | MPRV | TVM | TW | TSR;
 pub const MISA: u64 =
     (2 << 62) | (1 << 0) | (1 << 2) | (1 << 3) | (1 << 5) | (1 << 8) | (1 << 12) | (1 << 18) | (1 << 20);
@@ -43,7 +42,6 @@ pub struct Csrs {
     pub(crate) fcsr: u8,
     pub satp: Satp,
     pub pmp: Pmp,
-    pub vector: Option<crate::vector::VectorConfig>,
 }
 
 impl Csrs {
@@ -56,23 +54,12 @@ impl Csrs {
         interrupts: u64,
     ) -> Result<u64, CsrError> {
         self.check(address, mode)?;
-        let sd = if self.status & FS == FS || self.status & VS == VS {
-            1 << 63
-        } else {
-            0
-        };
+        let sd = if self.status & FS == FS { 1 << 63 } else { 0 };
         let pending = self.software_pending | (interrupts & INTERRUPTS);
         Ok(match address {
             0x001 => u64::from(self.fcsr & 31),
             0x002 => u64::from(self.fcsr >> 5),
             0x003 => self.fcsr.into(),
-            0x008 => self.vector.as_ref().unwrap().vstart,
-            0x009 => self.vector.as_ref().unwrap().vcsr & 1,
-            0x00a => self.vector.as_ref().unwrap().vcsr >> 1,
-            0x00f => self.vector.as_ref().unwrap().vcsr,
-            0xc20 => self.vector.as_ref().unwrap().vl,
-            0xc21 => self.vector.as_ref().unwrap().vtype,
-            0xc22 => self.vector.as_ref().unwrap().vlen / 8,
             0x100 => (self.status & SSTATUS) | (2 << 32) | sd,
             0x104 => self.ie & self.ideleg,
             0x105 => self.tvec[0],
@@ -120,19 +107,6 @@ impl Csrs {
             0x001 => self.fcsr = (self.fcsr & !31) | (value as u8 & 31),
             0x002 => self.fcsr = (self.fcsr & 31) | ((value as u8 & 7) << 5),
             0x003 => self.fcsr = value as u8,
-            0x008 => {
-                let vector = self.vector.as_mut().unwrap();
-                vector.vstart = value & (vector.vlen - 1);
-            }
-            0x009 => {
-                let vector = self.vector.as_mut().unwrap();
-                vector.vcsr = (vector.vcsr & !1) | (value & 1);
-            }
-            0x00a => {
-                let vector = self.vector.as_mut().unwrap();
-                vector.vcsr = (vector.vcsr & 1) | ((value & 3) << 1);
-            }
-            0x00f => self.vector.as_mut().unwrap().vcsr = value & 7,
             0x100 => self.status = (self.status & !SSTATUS) | (value & SSTATUS),
             0x104 => self.ie = (self.ie & !self.ideleg) | (value & self.ideleg),
             0x105 | 0x305 => {
@@ -177,12 +151,6 @@ impl Csrs {
             }
             _ => return Err(CsrError),
         }
-        if self.vector.is_none() {
-            self.status &= !VS;
-        }
-        if matches!(address, 0x008..=0x00a | 0x00f) {
-            self.status |= VS;
-        }
         if (1..=3).contains(&address) {
             self.status |= FS;
         }
@@ -191,10 +159,6 @@ impl Csrs {
 
     fn check(&self, address: u16, mode: Privilege) -> Result<(), CsrError> {
         if address > 0xfff || (address >> 8) & 3 > mode as u16 {
-            return Err(CsrError);
-        }
-        if matches!(address, 0x008..=0x00a | 0x00f | 0xc20..=0xc22) && (self.vector.is_none() || self.status & VS == 0)
-        {
             return Err(CsrError);
         }
         if (1..=3).contains(&address) && self.status & FS == 0 {

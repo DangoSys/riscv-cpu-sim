@@ -2,18 +2,11 @@ use crate::{
     bus::{Bus, HartBus, Width},
     compressed,
     csr::{Csrs, FS, INTERRUPTS, MIE, MPIE, MPP, MPRV, SIE, SPIE, SPP, TSR, TVM, TW},
+    input::Environment,
     mmu::{Mmu, TranslationContext},
     Access, Privilege, Trap,
 };
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Inputs {
-    pub time: u64,
-    // Elapsed core clock cycles supplied by the platform, including during WFI.
-    pub cycles: u64,
-    // Level-sensitive interrupt lines, at the corresponding mip bit positions.
-    pub interrupts: u64,
-}
+use std::cell::Cell;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CustomInstruction {
@@ -31,6 +24,27 @@ pub enum Step {
     Custom(CustomInstruction),
 }
 
+#[derive(Clone, Copy)]
+struct Instruction {
+    address: u64,
+    upper_address: u64,
+    raw: u32,
+    decoded: u32,
+    length: u64,
+}
+
+#[derive(Clone, Copy)]
+struct TranslationPage {
+    virtual_page: u64,
+    physical_page: u64,
+    privilege: Privilege,
+    satp: crate::mmu::Satp,
+    status: u64,
+    pmp_generation: u64,
+    mmu_generation: u64,
+    pmp_covers_page: bool,
+}
+
 pub struct Hart {
     pub id: u64,
     pub pc: u64,
@@ -40,6 +54,8 @@ pub struct Hart {
     pub f: [u64; 32],
     waiting: bool,
     custom: Option<CustomInstruction>,
+    instructions: Box<[Option<Instruction>; 1024]>,
+    pages: [Cell<Option<TranslationPage>>; 513],
 }
 
 impl Hart {
@@ -53,6 +69,8 @@ impl Hart {
             f: [0; 32],
             waiting: false,
             custom: None,
+            instructions: Box::new([None; 1024]),
+            pages: [const { Cell::new(None) }; 513],
         }
     }
 
@@ -75,51 +93,166 @@ impl Hart {
         }
     }
 
-    pub fn step(&mut self, bus: &mut impl HartBus, mmu: &Mmu, inputs: Inputs) -> Step {
+    #[inline(always)]
+    fn translate(
+        &self,
+        bus: &mut impl Bus,
+        mmu: &Mmu,
+        address: u64,
+        width: Width,
+        access: Access,
+    ) -> Result<u64, Trap> {
+        if address & (width as u64 - 1) != 0 {
+            return Err(access.misaligned(address));
+        }
+        let page = address >> 12;
+        let generation = mmu.generation();
+        let bucket = ((page ^ (page >> 5)) & 255) as usize;
+        let slot = match access {
+            Access::Fetch => 0,
+            Access::Load => 1 + bucket * 2,
+            Access::Store => 2 + bucket * 2,
+        };
+        let context = self.translation_context();
+        let mode = context.effective_privilege(access);
+        match self.pages[slot].get() {
+            Some(cached)
+                if cached.virtual_page == page
+                    && cached.privilege == self.privilege
+                    && cached.satp == self.csrs.satp
+                    && cached.status == self.csrs.status
+                    && cached.pmp_generation == self.csrs.pmp.generation()
+                    && cached.mmu_generation == generation =>
+            {
+                let physical = cached.physical_page << 12 | (address & 0xfff);
+                if !cached.pmp_covers_page && !self.csrs.pmp.allows(physical, width, access, mode) {
+                    return Err(access.fault(address));
+                }
+                Ok(physical)
+            }
+            _ => {
+                let physical = mmu.translate(bus, &context, address, width, access)?;
+                self.pages[slot].set(Some(TranslationPage {
+                    virtual_page: page,
+                    physical_page: physical >> 12,
+                    privilege: self.privilege,
+                    satp: self.csrs.satp,
+                    status: self.csrs.status,
+                    pmp_generation: self.csrs.pmp.generation(),
+                    mmu_generation: generation,
+                    pmp_covers_page: self.csrs.pmp.allows_range(physical & !0xfff, 4096, access, mode),
+                }));
+                Ok(physical)
+            }
+        }
+    }
+
+    fn fetch(&mut self, bus: &mut impl Bus, mmu: &Mmu) -> Result<Instruction, Trap> {
+        let address = self.translate(bus, mmu, self.pc, Width::Half, Access::Fetch)?;
+        let slot = (address as usize >> 1) & (self.instructions.len() - 1);
+        if let Some(instruction) = self.instructions[slot] {
+            if instruction.address == address {
+                if instruction.length == 2 {
+                    return Ok(instruction);
+                }
+                let upper = if self.pc & 0xfff == 0xffe {
+                    self.translate(bus, mmu, self.pc.wrapping_add(2), Width::Half, Access::Fetch)?
+                } else {
+                    let upper = address + 2;
+                    if upper >> 56 != 0
+                        || (!self.pages[0].get().unwrap().pmp_covers_page
+                            && !self.csrs.pmp.allows(upper, Width::Half, Access::Fetch, self.privilege))
+                    {
+                        return Err(Access::Fetch.fault(self.pc.wrapping_add(2)));
+                    }
+                    upper
+                };
+                if instruction.upper_address == upper {
+                    return Ok(instruction);
+                }
+            }
+        }
+        let low = bus
+            .read(address, Width::Half)
+            .map_err(|_| Access::Fetch.fault(self.pc))? as u32;
+        let instruction = if low & 3 != 3 {
+            Instruction {
+                address,
+                upper_address: address,
+                raw: low,
+                decoded: compressed::decode(low as u16)?,
+                length: 2,
+            }
+        } else {
+            let upper_address = if self.pc & 0xfff == 0xffe {
+                self.translate(bus, mmu, self.pc.wrapping_add(2), Width::Half, Access::Fetch)?
+            } else {
+                let upper = address + 2;
+                if upper >> 56 != 0
+                    || (!self.pages[0].get().unwrap().pmp_covers_page
+                        && !self.csrs.pmp.allows(upper, Width::Half, Access::Fetch, self.privilege))
+                {
+                    return Err(Access::Fetch.fault(self.pc.wrapping_add(2)));
+                }
+                upper
+            };
+            let high = bus
+                .read(upper_address, Width::Half)
+                .map_err(|_| Access::Fetch.fault(self.pc.wrapping_add(2)))? as u32;
+            let raw = low | high << 16;
+            Instruction {
+                address,
+                upper_address,
+                raw,
+                decoded: raw,
+                length: 4,
+            }
+        };
+        self.instructions[slot] = Some(instruction);
+        Ok(instruction)
+    }
+
+    pub fn step(&mut self, bus: &mut impl HartBus, mmu: &Mmu, inputs: impl Environment) -> Step {
         assert!(
             self.custom.is_none(),
             "complete the pending custom instruction before stepping"
         );
+        let cycles = inputs.cycles();
         if self.csrs.inhibit & 1 == 0 {
-            self.csrs.cycle = self.csrs.cycle.wrapping_add(inputs.cycles);
+            self.csrs.cycle = self.csrs.cycle.wrapping_add(cycles);
         }
-        let pending = (inputs.interrupts | self.csrs.software_pending) & self.csrs.ie & INTERRUPTS;
+        let pending = if self.csrs.ie & INTERRUPTS != 0 {
+            (inputs.interrupts() | self.csrs.software_pending) & self.csrs.ie & INTERRUPTS
+        } else {
+            0
+        };
         if pending != 0 {
             self.waiting = false;
-        }
-        for cause in [11, 3, 7, 9, 1, 5] {
-            let mask = 1 << cause;
-            let delegated = self.csrs.ideleg & mask != 0;
-            let enabled = if delegated {
-                self.privilege == Privilege::User
-                    || (self.privilege == Privilege::Supervisor && self.csrs.status & SIE != 0)
-            } else {
-                self.privilege != Privilege::Machine || self.csrs.status & MIE != 0
-            };
-            if pending & mask != 0 && enabled {
-                let trap = Trap {
-                    cause: (1 << 63) | cause,
-                    value: 0,
+            for cause in [11, 3, 7, 9, 1, 5] {
+                let mask = 1 << cause;
+                let delegated = self.csrs.ideleg & mask != 0;
+                let enabled = if delegated {
+                    self.privilege == Privilege::User
+                        || (self.privilege == Privilege::Supervisor && self.csrs.status & SIE != 0)
+                } else {
+                    self.privilege != Privilege::Machine || self.csrs.status & MIE != 0
                 };
-                self.enter_trap(trap);
-                return Step::Trap(trap);
+                if pending & mask != 0 && enabled {
+                    let trap = Trap {
+                        cause: (1 << 63) | cause,
+                        value: 0,
+                    };
+                    self.enter_trap(trap);
+                    return Step::Trap(trap);
+                }
             }
         }
         if self.waiting {
             return Step::Waiting;
         }
         let pc = self.pc;
-        let fetched = (|| {
-            let low = self.load(bus, mmu, pc, Width::Half, Access::Fetch)? as u32;
-            if low & 3 != 3 {
-                Ok((low, compressed::decode(low as u16)?, 2))
-            } else {
-                let high = self.load(bus, mmu, pc.wrapping_add(2), Width::Half, Access::Fetch)? as u32;
-                Ok((low | high << 16, low | high << 16, 4))
-            }
-        })();
-        let (raw, instruction, length) = match fetched {
-            Ok(fetched) => fetched,
+        let (raw, instruction, length) = match self.fetch(bus, mmu) {
+            Ok(fetched) => (fetched.raw, fetched.decoded, fetched.length),
             Err(trap) => {
                 self.enter_trap(trap);
                 return Step::Trap(trap);
@@ -137,7 +270,7 @@ impl Hart {
         }
         self.csrs.instret_written = false;
         let count_retired = self.csrs.inhibit & 4 == 0;
-        match self.execute(bus, mmu, inputs, instruction, pc.wrapping_add(length)) {
+        match self.execute(bus, mmu, &inputs, instruction, pc.wrapping_add(length)) {
             Ok(next_pc) => {
                 self.pc = next_pc;
                 if count_retired && !self.csrs.instret_written {
@@ -237,7 +370,7 @@ impl Hart {
             let mut value = 0;
             for byte in 0..width as u64 {
                 let virtual_address = address.wrapping_add(byte);
-                let physical = mmu.translate(bus, &self.translation_context(), virtual_address, Width::Byte, access)?;
+                let physical = self.translate(bus, mmu, virtual_address, Width::Byte, access)?;
                 value |= bus
                     .read(physical, Width::Byte)
                     .map_err(|_| access.fault(virtual_address))?
@@ -245,7 +378,7 @@ impl Hart {
             }
             return Ok(value);
         }
-        let physical = mmu.translate(bus, &self.translation_context(), address, width, access)?;
+        let physical = self.translate(bus, mmu, address, width, access)?;
         bus.read(physical, width).map_err(|_| access.fault(address))
     }
 
@@ -261,19 +394,13 @@ impl Hart {
         if address & (width as u64 - 1) != 0 {
             for byte in 0..width as u64 {
                 let virtual_address = address.wrapping_add(byte);
-                let physical = mmu.translate(
-                    bus,
-                    &self.translation_context(),
-                    virtual_address,
-                    Width::Byte,
-                    Access::Store,
-                )?;
+                let physical = self.translate(bus, mmu, virtual_address, Width::Byte, Access::Store)?;
                 bus.write(physical, Width::Byte, (value >> (8 * byte)) & 0xff)
                     .map_err(|_| Access::Store.fault(virtual_address))?;
             }
             return Ok(());
         }
-        let physical = mmu.translate(bus, &self.translation_context(), address, width, Access::Store)?;
+        let physical = self.translate(bus, mmu, address, width, Access::Store)?;
         bus.write(physical, width, value)
             .map_err(|_| Access::Store.fault(address))
     }
@@ -282,7 +409,7 @@ impl Hart {
         &mut self,
         bus: &mut impl HartBus,
         mmu: &Mmu,
-        inputs: Inputs,
+        inputs: &impl Environment,
         insn: u32,
         mut next: u64,
     ) -> Result<u64, Trap> {
@@ -441,9 +568,12 @@ impl Hart {
                     value
                 }
             }
-            0x0f if funct == 0 || funct == 1 => return Ok(next), // ordered bus; no I-cache
+            0x0f if funct == 0 => return Ok(next),
+            0x0f if funct == 1 => {
+                self.instructions.fill(None);
+                return Ok(next);
+            }
             0x2f => self.atomic(bus, mmu, insn, a, b)?,
-            0x57 if funct == 7 => self.configure_vector(insn, a, b)?,
             0x73 => {
                 if funct == 0 {
                     match insn {
@@ -500,7 +630,17 @@ impl Hart {
                 let operand = if funct & 4 != 0 { rs1 as u64 } else { a };
                 let old = self
                     .csrs
-                    .read(address, self.privilege, self.id, inputs.time, inputs.interrupts)
+                    .read(
+                        address,
+                        self.privilege,
+                        self.id,
+                        if address == 0xc01 { inputs.time() } else { 0 },
+                        if matches!(address, 0x144 | 0x344) {
+                            inputs.interrupts()
+                        } else {
+                            0
+                        },
+                    )
                     .map_err(|_| illegal)?;
                 let write = funct & 3 == 1 || rs1 != 0;
                 if write {
@@ -543,7 +683,7 @@ impl Hart {
             return Err(Trap::illegal(insn));
         }
         let access = if op == 2 { Access::Load } else { Access::Store };
-        let physical = mmu.translate(bus, &self.translation_context(), address, width, access)?;
+        let physical = self.translate(bus, mmu, address, width, access)?;
         if op == 2 {
             let old = bus
                 .load_reserved(self.id, physical, width)

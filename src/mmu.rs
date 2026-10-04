@@ -3,6 +3,10 @@ use crate::{
     pmp::Pmp,
     Access, Privilege, Trap,
 };
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Mutex,
+};
 
 const PPN_MASK: u64 = (1 << 44) - 1;
 const MPRV: u64 = 1 << 17;
@@ -49,16 +53,42 @@ pub struct TranslationContext<'a> {
     pub pmp: &'a Pmp,
 }
 
-#[derive(Default)]
+impl TranslationContext<'_> {
+    pub(crate) fn effective_privilege(&self, access: Access) -> Privilege {
+        if access != Access::Fetch && self.privilege == Privilege::Machine && self.mstatus & MPRV != 0 {
+            match (self.mstatus >> 11) & 3 {
+                0 => Privilege::User,
+                1 => Privilege::Supervisor,
+                3 => Privilege::Machine,
+                _ => panic!("reserved mstatus.MPP"),
+            }
+        } else {
+            self.privilege
+        }
+    }
+}
+
 pub struct Mmu {
-    cache: std::sync::Mutex<Cache>,
+    cache: Mutex<Cache>,
+    generation: AtomicU64,
+}
+
+static GENERATION: AtomicU64 = AtomicU64::new(1);
+
+impl Default for Mmu {
+    fn default() -> Self {
+        Self {
+            cache: Mutex::new(Cache::default()),
+            generation: AtomicU64::new(GENERATION.fetch_add(1, Ordering::Relaxed)),
+        }
+    }
 }
 
 struct Context {
     satp: Satp,
     status: u64,
     privilege: Privilege,
-    pmp: Pmp,
+    pmp_generation: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -84,7 +114,14 @@ impl Default for Cache {
 
 impl Mmu {
     pub fn fence(&self) {
-        self.cache.lock().expect("MMU cache poisoned").pages.fill(None);
+        let mut cache = self.cache.lock().expect("MMU cache poisoned");
+        cache.pages.fill(None);
+        self.generation
+            .store(GENERATION.fetch_add(1, Ordering::Relaxed), Ordering::Release);
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
     pub fn translate(
@@ -98,29 +135,24 @@ impl Mmu {
         if address & (width as u64 - 1) != 0 {
             return Err(access.misaligned(address));
         }
-        let mut mode = context.privilege;
-        if access != Access::Fetch && mode == Privilege::Machine && context.mstatus & MPRV != 0 {
-            mode = match (context.mstatus >> 11) & 3 {
-                0 => Privilege::User,
-                1 => Privilege::Supervisor,
-                3 => Privilege::Machine,
-                _ => panic!("reserved mstatus.MPP"),
-            };
-        }
+        let mode = context.effective_privilege(access);
         let physical = if mode == Privilege::Machine || context.satp == Satp::Bare {
             address
         } else {
             let mut cache = self.cache.lock().expect("MMU cache poisoned");
             let status = context.mstatus & (SUM | MXR);
             if cache.context.as_ref().is_none_or(|old| {
-                old.satp != context.satp || old.status != status || old.privilege != mode || old.pmp != *context.pmp
+                old.satp != context.satp
+                    || old.status != status
+                    || old.privilege != mode
+                    || old.pmp_generation != context.pmp.generation()
             }) {
                 cache.pages.fill(None);
                 cache.context = Some(Context {
                     satp: context.satp,
                     status,
                     privilege: mode,
-                    pmp: context.pmp.clone(),
+                    pmp_generation: context.pmp.generation(),
                 });
             }
             let virtual_page = address >> 12;

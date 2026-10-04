@@ -11,13 +11,17 @@ use rustc_apfloat::{
 };
 
 impl Hart {
-    fn single(&self, index: usize) -> Single {
+    fn single_bits(&self, index: usize) -> u64 {
         let bits = self.f[index];
-        Single::from_bits(if bits >> 32 == u32::MAX as u64 {
-            bits as u32 as u128
+        if bits >> 32 == u32::MAX as u64 {
+            bits as u32 as u64
         } else {
             0x7fc00000
-        })
+        }
+    }
+
+    fn single(&self, index: usize) -> Single {
+        Single::from_bits(self.single_bits(index).into())
     }
 
     fn rounding(&self, insn: u32) -> Result<Round, Trap> {
@@ -64,10 +68,10 @@ impl Hart {
             };
             return self.store(bus, mmu, address, width, self.f[rs2]);
         }
-        let a = self.single(rs1);
-        let b = self.single(rs2);
-        let da = Double::from_bits(self.f[rs1].into());
-        let db = Double::from_bits(self.f[rs2].into());
+        let a = || self.single(rs1);
+        let b = || self.single(rs2);
+        let da = || Double::from_bits(self.f[rs1].into());
+        let db = || Double::from_bits(self.f[rs2].into());
         let mut integer = false;
         let single;
         let result;
@@ -75,17 +79,17 @@ impl Hart {
             let rm = self.rounding(insn)?;
             match (insn >> 25) & 3 {
                 0 => {
-                    let a = if opcode == 0x4b || opcode == 0x4f { -a } else { a };
+                    let factor = if opcode == 0x4b || opcode == 0x4f { -a() } else { a() };
                     let c = self.single(rs3);
                     let c = if opcode == 0x47 || opcode == 0x4f { -c } else { c };
-                    result = a.mul_add_r(b, c, rm).map(|v| v.to_bits() as u64);
+                    result = factor.mul_add_r(b(), c, rm).map(|v| v.to_bits() as u64);
                     single = true;
                 }
                 1 => {
-                    let a = if opcode == 0x4b || opcode == 0x4f { -da } else { da };
+                    let factor = if opcode == 0x4b || opcode == 0x4f { -da() } else { da() };
                     let c = Double::from_bits(self.f[rs3].into());
                     let c = if opcode == 0x47 || opcode == 0x4f { -c } else { c };
-                    result = a.mul_add_r(db, c, rm).map(|v| v.to_bits() as u64);
+                    result = factor.mul_add_r(db(), c, rm).map(|v| v.to_bits() as u64);
                     single = false;
                 }
                 _ => return Err(illegal),
@@ -93,35 +97,41 @@ impl Hart {
         } else {
             single = op & 1 == 0;
             result = match op {
-                0x00 => a.add_r(b, self.rounding(insn)?).map(|v| v.to_bits() as u64),
-                0x01 => da.add_r(db, self.rounding(insn)?).map(|v| v.to_bits() as u64),
-                0x04 => a.sub_r(b, self.rounding(insn)?).map(|v| v.to_bits() as u64),
-                0x05 => da.sub_r(db, self.rounding(insn)?).map(|v| v.to_bits() as u64),
-                0x08 => a.mul_r(b, self.rounding(insn)?).map(|v| v.to_bits() as u64),
-                0x09 => da.mul_r(db, self.rounding(insn)?).map(|v| v.to_bits() as u64),
-                0x0c => a.div_r(b, self.rounding(insn)?).map(|v| v.to_bits() as u64),
-                0x0d => da.div_r(db, self.rounding(insn)?).map(|v| v.to_bits() as u64),
-                0x2c if rs2 == 0 => sqrt(a.to_bits() as u64, true, self.rounding(insn)?),
-                0x2d if rs2 == 0 => sqrt(da.to_bits() as u64, false, self.rounding(insn)?),
+                0x00 => a().add_r(b(), self.rounding(insn)?).map(|v| v.to_bits() as u64),
+                0x01 => da().add_r(db(), self.rounding(insn)?).map(|v| v.to_bits() as u64),
+                0x04 => a().sub_r(b(), self.rounding(insn)?).map(|v| v.to_bits() as u64),
+                0x05 => da().sub_r(db(), self.rounding(insn)?).map(|v| v.to_bits() as u64),
+                0x08 => a().mul_r(b(), self.rounding(insn)?).map(|v| v.to_bits() as u64),
+                0x09 => da().mul_r(db(), self.rounding(insn)?).map(|v| v.to_bits() as u64),
+                0x0c => a().div_r(b(), self.rounding(insn)?).map(|v| v.to_bits() as u64),
+                0x0d => da().div_r(db(), self.rounding(insn)?).map(|v| v.to_bits() as u64),
+                0x2c if rs2 == 0 => sqrt(a().to_bits() as u64, true, self.rounding(insn)?),
+                0x2d if rs2 == 0 => sqrt(da().to_bits() as u64, false, self.rounding(insn)?),
                 0x10 => {
+                    let a = self.single_bits(rs1);
+                    let b = self.single_bits(rs2);
                     let sign = match funct {
-                        0 => b.to_bits(),
-                        1 => !b.to_bits(),
-                        2 => a.to_bits() ^ b.to_bits(),
+                        0 => b,
+                        1 => !b,
+                        2 => a ^ b,
                         _ => return Err(illegal),
                     };
-                    Status::OK.and(((a.to_bits() & 0x7fffffff) | (sign & 0x80000000)) as u64)
+                    Status::OK.and((a & 0x7fffffff) | (sign & 0x80000000))
                 }
                 0x11 => {
+                    let a = self.f[rs1];
+                    let b = self.f[rs2];
                     let sign = match funct {
-                        0 => db.to_bits(),
-                        1 => !db.to_bits(),
-                        2 => da.to_bits() ^ db.to_bits(),
+                        0 => b,
+                        1 => !b,
+                        2 => a ^ b,
                         _ => return Err(illegal),
                     };
-                    Status::OK.and(((da.to_bits() & 0x7fffffffffffffff) | (sign & 0x8000000000000000)) as u64)
+                    Status::OK.and((a & 0x7fffffffffffffff) | (sign & 0x8000000000000000))
                 }
                 0x14 if funct <= 1 => {
+                    let a = a();
+                    let b = b();
                     let status = if a.is_signaling() || b.is_signaling() {
                         Status::INVALID_OP
                     } else {
@@ -139,6 +149,8 @@ impl Hart {
                     status.and(value.to_bits() as u64)
                 }
                 0x15 if funct <= 1 => {
+                    let da = da();
+                    let db = db();
                     let status = if da.is_signaling() || db.is_signaling() {
                         Status::INVALID_OP
                     } else {
@@ -156,14 +168,16 @@ impl Hart {
                     status.and(value.to_bits() as u64)
                 }
                 0x20 if rs2 == 1 => {
-                    let converted: StatusAnd<Single> = da.convert_r(self.rounding(insn)?, &mut false);
+                    let converted: StatusAnd<Single> = da().convert_r(self.rounding(insn)?, &mut false);
                     converted.map(|v| v.to_bits() as u64)
                 }
                 0x21 if rs2 == 0 => {
-                    let converted: StatusAnd<Double> = a.convert_r(self.rounding(insn)?, &mut false);
+                    let converted: StatusAnd<Double> = a().convert_r(self.rounding(insn)?, &mut false);
                     converted.map(|v| v.to_bits() as u64)
                 }
                 0x50 if funct <= 2 => {
+                    let a = a();
+                    let b = b();
                     integer = true;
                     let invalid = a.is_signaling() || b.is_signaling() || (funct != 2 && (a.is_nan() || b.is_nan()));
                     let value = match funct {
@@ -175,6 +189,8 @@ impl Hart {
                     (if invalid { Status::INVALID_OP } else { Status::OK }).and(u64::from(value))
                 }
                 0x51 if funct <= 2 => {
+                    let da = da();
+                    let db = db();
                     integer = true;
                     let invalid =
                         da.is_signaling() || db.is_signaling() || (funct != 2 && (da.is_nan() || db.is_nan()));
@@ -187,6 +203,7 @@ impl Hart {
                     (if invalid { Status::INVALID_OP } else { Status::OK }).and(u64::from(value))
                 }
                 0x60 if rs2 <= 3 => {
+                    let a = a();
                     integer = true;
                     let rm = self.rounding(insn)?;
                     let width = if rs2 < 2 { 32 } else { 64 };
@@ -204,6 +221,7 @@ impl Hart {
                     converted
                 }
                 0x61 if rs2 <= 3 => {
+                    let da = da();
                     integer = true;
                     let rm = self.rounding(insn)?;
                     let width = if rs2 < 2 { 32 } else { 64 };
@@ -246,7 +264,7 @@ impl Hart {
                     integer = true;
                     Status::OK.and(match funct {
                         0 => self.f[rs1] as i32 as u64,
-                        1 => classify(a.to_bits() as u64, true),
+                        1 => classify(self.single_bits(rs1), true),
                         _ => return Err(illegal),
                     })
                 }
@@ -254,7 +272,7 @@ impl Hart {
                     integer = true;
                     Status::OK.and(match funct {
                         0 => self.f[rs1],
-                        1 => classify(da.to_bits() as u64, false),
+                        1 => classify(self.f[rs1], false),
                         _ => return Err(illegal),
                     })
                 }
@@ -276,10 +294,10 @@ impl Hart {
         } else {
             // Arithmetic returns the RISC-V canonical NaN; sign injection and moves preserve payloads.
             if opcode != 0x53 || !matches!(op, 0x10 | 0x11 | 0x78 | 0x79) {
-                if single && Single::from_bits(value.into()).is_nan() {
+                if single && value & 0x7f800000 == 0x7f800000 && value & 0x007fffff != 0 {
                     value = 0x7fc00000;
                 }
-                if !single && Double::from_bits(value.into()).is_nan() {
+                if !single && value & 0x7ff0000000000000 == 0x7ff0000000000000 && value & 0x000fffffffffffff != 0 {
                     value = 0x7ff8000000000000;
                 }
             }
