@@ -1,3 +1,4 @@
+mod bitmanip;
 pub mod bus;
 mod compressed;
 pub use compressed::decode as expand_compressed;

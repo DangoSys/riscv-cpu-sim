@@ -423,6 +423,10 @@ impl Hart {
         let b = self.x[rs2];
         let imm = ((insn as i32) >> 20) as u64;
         let illegal = Trap::illegal(insn);
+        if let Some(value) = crate::bitmanip::execute(insn, a, b, 64) {
+            self.set_register(rd, value);
+            return Ok(next);
+        }
         let value = match opcode {
             0x37 => (insn & 0xfffff000) as i32 as u64,
             0x17 => self.pc.wrapping_add((insn & 0xfffff000) as i32 as u64),
